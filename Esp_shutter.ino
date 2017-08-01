@@ -1,17 +1,24 @@
-//Firmware that controls an automated shutter. Since the up and down lines should not be activated simultaneosly, the controller forces a short delay to ensure tht the SSR switches at the right point.
+//Template of firmware for ESP 8266 to control an automated system with MQTT protocol
 
 //Global includes
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 
-//Define constants
-#define SWITCHUP  12
-#define SWITCHDOWN   14
-#define LIGHT     4
-#define NO_WIFI   5000
-#define NO_MQTT   500
-#define WORKING   10000
-#define DELAY     100
+//Define constants: pin numbers and delays. Warning: do not use PIN GPIO 16 (D0) since it is LED_BUILTIN
+#define NO_WIFI   200
+#define NO_MQTT   1000
+#define WORKING   0
+#define PUB_DELAY 30000
+#define SSR_DELAY 50
+#define ERR       4
+#define UPSWITCH  12
+#define DOWNSWITCH  14
+#define UP        4
+#define DOWN      5
+#define OPEN_CMD  0
+#define CLOSE_CMD 1
+#define STOP_CMD  2
+#define MAX_TILT  180
 
 //Global constants
 // Wifi
@@ -30,100 +37,129 @@ const PROGMEM char* TILT_STATE_TOPIC = "shutter/tilt/status";
 const PROGMEM char* TILT_COMMAND_TOPIC = "shutter/tilt/commands";
 
 // payload
-const char* LIGHT_ON = "ON";
-const char* LIGHT_OFF = "OFF";
+const char* PAYLOAD_OPEN = "OPEN";
+const char* PAYLOAD_CLOSE = "CLOSE";
+const char* PAYLOAD_STOP = "STOP";
 
 //Global variables
-bool lightStatus = false;
 bool ledStatus = false;
 bool wifiRequested = false;
-bool publishStatus = true;
-unsigned long prevBlinkMillis = 0;
-unsigned long blinkInterval = 0;
-unsigned long prevDebounceMillis = 0;
-volatile uint8_t command = 0;
-
+unsigned long nextBlinkMillis = 0;
+unsigned long nextStatusMillis = 0;
+bool publishStatus = false;
+unsigned long blinkInterval = NO_WIFI;
+volatile uint8_t command = ERR;
+unsigned long prevCmdMillis = 0;
+unsigned long stopCmdMillis = 0;
+unsigned long tilt = 0;
 WiFiClient wfClient;
 PubSubClient mqttClient;
 
+
+
+//Set up the sketch components
 void setup() {
-  Serial.begin(115200);
-  // Init the pins
-  pinMode(SWITCHUP, INPUT);
-  pinMode(SWITCHDOWN, INPUT);
-  pinMode(LIGHT, OUTPUT);
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
-  digitalWrite(LIGHT, HIGH);
-  delay(500);
-  digitalWrite(LED_BUILTIN, HIGH);
   
-  //Init the global variables
-  lightStatus = false;
-  ledStatus = true;
-  readSwitches();
-  blinkInterval = NO_WIFI;
+  //Serial setup. Serial can be left in the final sketch since the ESP has lots of memory
+  Serial.begin(115200);
+  
+  //Pins initialization
+  pinMode(UPSWITCH, INPUT);
+  pinMode(DOWNSWITCH, INPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(UP, OUTPUT);
+  pinMode(DOWN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+  digitalWrite(UP, LOW);
+  digitalWrite(DOWN, LOW);
 
   // Init the mqtt client parameters
   mqttClient.setClient(wfClient);
   mqttClient.setServer(SERVER, PORT);
   mqttClient.setCallback(callback);
 
-  //Safety initial delay
-  delay(500);
+  //Led initialization and pattern
+  delay(1000);
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  //Init timer global variables
+  nextBlinkMillis = millis() + blinkInterval;
+  nextStatusMillis = millis() + PUB_DELAY;
+  prevCmdMillis = 0;
   
-  //Set the starting point for flashing
-  prevBlinkMillis = millis();
-  prevDebounceMillis = millis();
 }
 
+
+
+//Code to run repeatedly
 void loop() {
-  //Check if there is something to do
-  checkEverything();
-  //A flashing speed has been set. Follow it.
-  unsigned long tempMillis = millis();
-  //Millis overflow check
-  if(tempMillis < prevBlinkMillis) {
-    prevBlinkMillis = 0;
+
+  //Execute the command if registered. Save the command variable to avoid incoherent results caused by its modification
+  uint8_t cmd = command;
+  command = ERR;
+  executeCommand(cmd);
+  
+  //Check the timers
+  checkTimers();
+  
+  //Check the connectivity
+  checkConnectivity();
+  
+}
+
+
+
+//Execute a command
+void executeCommand(uint8_t cmd) {
+  
+  if (cmd == OPEN_CMD) {
+    //First stop the shutter
+    executeCmd(STOP_CMD);
+    unsigned long currMillis = millis();
+    unsigned long tiltDelta = MAX_TILT - tilt;
+    stopCmdMillis = currMillis + tiltDelta;
+    
+  } else if (cmd == CLOSE_CMD) {
+    
+  } else if (cmd == STOP_CMD) {
+    //Stop the shutter and insert a safety delay to avoid breaking of the zero-crossing SSRs.
+    digitalWrite(UP, LOW);
+    digitalWrite(DOWN, LOW);
+    delay(50);
+    
   }
+  
+}
+
+
+
+//This method checks if the Millis timers have expired. The timers work by saving the Millis value of the event. This way the Millis overflow problem is solved
+void checkTimers() {
+  
+  //Sample the current time
+  unsigned long currentMillis = millis();
 
   //Blink timer handling
-  if((tempMillis-prevBlinkMillis) >= blinkInterval) {
+  if (blinkInterval == WORKING) { //If the system is working leave the led on
+    digitalWrite(LED_BUILTIN, LOW);
+    ledStatus = true;
+  } else if(currentMillis >= nextBlinkMillis) {
     triggerLed();
-    prevBlinkMillis = millis();
-    if(blinkInterval == WORKING) {
-      publishStatus = true;
-    }
+    nextBlinkMillis = currentMillis + blinkInterval;
   }
 
-  //Check if the switches status has changed
-  bool manualChange = readSwitches(); //This sets the status of the switches to the new one
-  if(manualChange) {
-    prevDebounceMillis = tempMillis;
-    debounceInterval = DEBOUNCE_INT;
-  }
-
-  if(debounceInterval != 0 && (tempMillis-prevDebounceMillis) > debounceInterval) { //Equal removed because if the status changes, the timer is set to tempMillis
-    triggerLight(!lightStatus);
+  //Publish status timer handling
+  if(currentMillis >= nextStatusMillis) {
     publishStatus = true;
-    debounceInterval = 0;
-    Serial.println("SWITCH TRIGGER");
+    nextStatusMillis = currentMillis + PUB_DELAY;
   }
   
 }
 
-//This method checks that everything is in order
-void checkEverything() {
-  //First check if any MQTT command was received
-  if (command == 1) {
-    triggerLight(true);
-    command = 0;
-    publishStatus = true;
-  } else if (command == 2) {
-    triggerLight(false);
-    command = 0;
-    publishStatus = true;
-  }
+
+
+//This method checks that the wifi is connected and sets the led blink time if there is anything wrong
+void checkConnectivity() {
 
   //Check if the wifi is not connected
   if(WiFi.status() != WL_CONNECTED) {
@@ -134,10 +170,11 @@ void checkEverything() {
     }
   } else {
     wifiRequested = false;
-    //Check if MQTT is connected
+    //Check if MQTT is not connected
     if (!mqttClient.connected()) {
       if(mqttClient.connect(CLIENT_ID, USERNAME, PASSWORD)) {
         mqttClient.subscribe(COMMAND_TOPIC);
+        /* Please add topics */
       }
       blinkInterval = NO_MQTT;
     } else {
@@ -145,20 +182,19 @@ void checkEverything() {
       //Publish the status
       if(publishStatus) {
         publishStatus = false;
-        if(lightStatus) {
-          mqttClient.publish(STATE_TOPIC, LIGHT_ON);
-        } else {
-          mqttClient.publish(STATE_TOPIC, LIGHT_OFF);
-        }
+        mqttClient.publish(STATE_TOPIC, PAYLOAD_ON);
+        /* Please add publish statements */
       }
       //Loop the client
       mqttClient.loop();
     }
   }
+  
 }
 
-//Callback to receive MQTT commands
-//Note that no command is executed here, it is only set
+
+
+//Callback to receive MQTT commands. This only sets the command voltaile variable.
 void callback(char* topic, byte* payload, unsigned int len) {
   
   //Parse the message
@@ -169,34 +205,22 @@ void callback(char* topic, byte* payload, unsigned int len) {
   }
   message_buff[i] = '\0';
   
-  String msgString = String(message_buff);
-
+  //Check the topic and the command
+  if(strcmp(topic, COMMAND_TOPIC) == 0) {
+    if(strcmp(message_buff, PAYLOAD_OPEN) == 0) {
+      command = OPEN_CMD;
+    } else if(strcmp(message_buff, PAYLOAD_CLOSE) == 0) {
+      command = CLOSE_CMD;
+    } else if(strcmp(message_buff, PAYLOAD_STOP) == 0) {
+      command = STOP_CMD;
+    }
+  }
   
-  //Ignore the topic since it is always the same
-  if (msgString.equals("ON")) {
-    command = 1;
-  } else if (msgString.equals("OFF")) {
-    command = 2;
-  }
 }
 
 
-//Read the switches and set the status
-bool readSwitches() {
-  bool ret = false;
-  int temp1 = digitalRead(SWITCH1);
-  int temp2 = digitalRead(SWITCH2);
-  Serial.print(temp1);
-  Serial.print("     ");
-  Serial.println(temp2);
-  if(temp1 != switch1 || temp2 != switch2) {
-    ret = true;
-  }
-  switch1 = temp1;
-  switch2 = temp2;
-  return ret;
-}
 
+//This method triggers the LED_BUILTIN. Note that the LED is on when LOW is set
 void triggerLed() {
   if(ledStatus) {
     digitalWrite(LED_BUILTIN, HIGH);
@@ -205,15 +229,6 @@ void triggerLed() {
     digitalWrite(LED_BUILTIN, LOW);
     ledStatus = true;
   }
-}
-
-void triggerLight(bool light_on) {
-  if(light_on) {
-    digitalWrite(LIGHT, LOW);
-    lightStatus = true;
-  } else {
-    digitalWrite(LIGHT, HIGH);
-    lightStatus = false;
-  }
+  
 }
 
